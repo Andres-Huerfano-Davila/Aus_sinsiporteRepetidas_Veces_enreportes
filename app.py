@@ -10,7 +10,7 @@ import streamlit as st
 
 
 # ============================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN GENERAL
 # ============================================================
 
 st.set_page_config(
@@ -19,7 +19,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.markdown("""
+st.markdown(
+    """
 <style>
 .main-title {
     font-size: 34px;
@@ -40,21 +41,25 @@ st.markdown("""
     margin-bottom: 16px;
 }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 st.markdown('<p class="main-title">Generador Salida_Ausentismos</p>', unsafe_allow_html=True)
 st.markdown(
     '<p class="sub-title">Genera el Excel final con Matriz y Gestionados. Sin gráficas.</p>',
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
-st.markdown("""
+st.markdown(
+    """
 <div class="info-box">
-<b>Regla:</b> la base nace del Reporte_Aus_Acumulado. 
-Si en SF/Hello existe un registro APPROVED con mismo ID y fecha igual o solapada, pasa a Gestionados.
-Los demás registros quedan en Matriz.
+<b>Corrección V5:</b> el campo <b>id</b> de la Matriz corresponde al <b>SAP / Nº pers.</b>.
+La columna <b>Número de personal</b> se usa como nombre del empleado cuando el archivo viene desde SAP.
 </div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 # ============================================================
@@ -71,35 +76,47 @@ def norm_text(value):
     return value
 
 
-def clean_id(value):
+def dedupe_columns(df):
+    seen = {}
+    new_cols = []
+    for c in df.columns:
+        base = str(c).strip()
+        if base in seen:
+            seen[base] += 1
+            new_cols.append(f"{base}.{seen[base]}")
+        else:
+            seen[base] = 0
+            new_cols.append(base)
+    df.columns = new_cols
+    return df
+
+
+def clean_id_value(value):
     if pd.isna(value):
         return ""
     text = str(value).strip()
     if re.fullmatch(r"\d+\.0", text):
         text = text[:-2]
-    match = re.search(r"\d+", text)
-    return match.group(0) if match else text
+    m = re.search(r"\d+", text)
+    return m.group(0) if m else text
 
 
-def parse_date(value):
+def clean_id_series(s):
+    return s.astype(str).str.strip().str.replace(r"\.0$", "", regex=True).str.extract(r"(\d+)", expand=False).fillna(
+        s.astype(str).str.strip()
+    )
+
+
+def parse_date_series(s):
+    return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.normalize()
+
+
+def parse_date_value(value):
     if pd.isna(value) or value == "":
         return pd.NaT
     if isinstance(value, (pd.Timestamp, datetime)):
         return pd.to_datetime(value).normalize()
-
-    text = str(value).strip()
-    if text.lower() in {"", "nan", "nat", "none"}:
-        return pd.NaT
-
-    text = re.sub(r"\s+00:00:00$", "", text)
-
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d", "%m/%d/%Y"):
-        try:
-            return pd.Timestamp(datetime.strptime(text, fmt)).normalize()
-        except Exception:
-            pass
-
-    return pd.to_datetime(text, errors="coerce", dayfirst=True).normalize()
+    return pd.to_datetime(str(value).strip(), errors="coerce", dayfirst=True).normalize()
 
 
 def fmt_date(value):
@@ -109,17 +126,14 @@ def fmt_date(value):
     return f"{value.day:02d}/{value.month:02d}/{value.year}"
 
 
-def month_key(value):
-    if pd.isna(value):
-        return ""
-    value = pd.to_datetime(value)
-    return f"{value.year:04d}-{value.month:02d}"
+def month_key_series(s):
+    return pd.to_datetime(s, errors="coerce").dt.strftime("%Y-%m").fillna("")
 
 
-def ranges_overlap(a_ini, a_fin, b_ini, b_fin):
-    if pd.isna(a_ini) or pd.isna(a_fin) or pd.isna(b_ini) or pd.isna(b_fin):
-        return False
-    return (a_ini <= b_fin) and (b_ini <= a_fin)
+def make_key(df, id_col="id", ini_col="inicio", fin_col="fin"):
+    ini = pd.to_datetime(df[ini_col], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    fin = pd.to_datetime(df[fin_col], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    return df[id_col].astype(str).fillna("") + "|" + ini + "|" + fin
 
 
 def unique_join(values):
@@ -161,10 +175,40 @@ def find_col(df, candidates, required=True, label=""):
     return None
 
 
-def make_key(df, id_col="id", ini_col="inicio", fin_col="fin"):
-    ini = pd.to_datetime(df[ini_col], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
-    fin = pd.to_datetime(df[fin_col], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
-    return df[id_col].astype(str).fillna("") + "|" + ini + "|" + fin
+def first_existing_col(df, candidates):
+    try:
+        return find_col(df, candidates, required=False)
+    except Exception:
+        return None
+
+
+def derive_regional_from_division(value):
+    text = str(value)
+    # Soporta Región, Region y Regin cuando el TXT SAP pierde tildes/letras por encoding.
+    m = re.search(r"(?:Regi[oó]n|Region|Regin)\s*(\d+)", text, flags=re.IGNORECASE)
+    if not m:
+        return ""
+    return "R" + str(m.group(1)).zfill(2)
+
+
+def derive_zona_from_division(value):
+    text = str(value)
+    m = re.search(r"ZN\s*0?(\d+)", text, flags=re.IGNORECASE)
+    if not m:
+        return ""
+    code = "ZN" + str(m.group(1)).zfill(2)
+
+    # Mapeo simple para conservar estilo de muestra.
+    zone_names = {
+        "ZN01": "Zona Occidente ZN01",
+        "ZN02": "Zona Norte ZN02",
+        "ZN03": "Zona Centro ZN03",
+    }
+    return zone_names.get(code, code)
+
+
+def is_blank_series(s):
+    return s.astype(str).str.strip().str.lower().isin(["", "nan", "none", "nat"])
 
 
 # ============================================================
@@ -173,7 +217,8 @@ def make_key(df, id_col="id", ini_col="inicio", fin_col="fin"):
 
 @st.cache_data(show_spinner=False)
 def read_excel_cached(file_bytes):
-    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, engine="openpyxl")
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, engine="openpyxl")
+    return dedupe_columns(df)
 
 
 def detect_csv_header_line(raw_bytes, keywords):
@@ -191,7 +236,7 @@ def detect_csv_header_line(raw_bytes, keywords):
 def read_csv_cached(raw_bytes, skiprows):
     last_error = None
     for encoding in ["utf-8-sig", "latin-1"]:
-        for sep in [None, ";", ",", "\t", "|"]:
+        for sep in [",", ";", "\t", "|", None]:
             try:
                 df = pd.read_csv(
                     io.BytesIO(raw_bytes),
@@ -200,11 +245,11 @@ def read_csv_cached(raw_bytes, skiprows):
                     skiprows=skiprows,
                     encoding=encoding,
                     dtype=str,
-                    on_bad_lines="skip"
+                    on_bad_lines="skip",
                 )
                 if df.shape[1] > 1:
                     df.columns = [str(c).strip() for c in df.columns]
-                    return df
+                    return dedupe_columns(df)
             except Exception as e:
                 last_error = e
     raise ValueError(f"No pude leer el CSV. Último error: {last_error}")
@@ -214,32 +259,32 @@ def read_csv_cached(raw_bytes, skiprows):
 def read_md_txt_cached(raw_bytes):
     text = raw_bytes.decode("utf-8-sig", errors="ignore")
 
-    # Si parece tabla SAP con |
     if "|" in text:
-        lines = text.splitlines()
         rows = []
-        for line in lines:
+        for line in text.splitlines():
             if "|" in line and not set(line.strip()).issubset({"-", "|"}):
                 parts = [p.strip() for p in line.strip().strip("|").split("|")]
                 if len(parts) >= 5:
                     rows.append(parts)
 
         header_idx = None
-        for i, row in enumerate(rows):
-            nrow = " ".join(norm_text(x) for x in row)
-            if "status ocupacion" in nrow and ("n pers" in nrow or "numero de personal" in nrow):
+        for i, row in enumerate(rows[:80]):
+            nrow = [norm_text(x) for x in row]
+            joined = " ".join(nrow)
+            # Header SAP exportado: N pers. / Número de personal / Status ocupación...
+            if any("pers" in x for x in nrow[:2]) and any("status" in x for x in nrow[:6]):
                 header_idx = i
                 break
 
-        if header_idx is not None:
-            header = rows[header_idx]
-            width = len(header)
-            data = [r for r in rows[header_idx + 1:] if len(r) == width]
-            df = pd.DataFrame(data, columns=header)
-            df.columns = [str(c).strip() for c in df.columns]
-            return df
+        if header_idx is None:
+            header_idx = 0
 
-    # Fallback como CSV
+        header = rows[header_idx]
+        width = len(header)
+        data = [r for r in rows[header_idx + 1:] if len(r) == width]
+        df = pd.DataFrame(data, columns=header)
+        return dedupe_columns(df)
+
     skip = detect_csv_header_line(raw_bytes, ["status", "personal"])
     return read_csv_cached(raw_bytes, skip)
 
@@ -268,32 +313,46 @@ def read_uploaded(uploaded, kind):
 # ============================================================
 
 def normalize_acumulado(df):
-    c_id = find_col(df, ["Número de personal", "Numero de personal", "Nº pers.", "No pers", "id"], label="ID acumulado")
-    c_nombre = find_col(df, ["Nombre empl./cand.", "Nombre", "Nombre empleado", "Nombre completo"], required=False)
-    c_tipo = find_col(df, [
-        "Txt.cl.pres./ab.3", "Txt.cl.pres", "Clase absent./pres.2",
-        "Clase de absentismo o presenci", "Clase absentismo", "Tipo",
-        "Descripción", "Descripc.enfermedad"
-    ], required=False)
-    c_ini = find_col(df, ["Inicio de validez", "Inicio", "Fecha Inicio", "startDate"], label="Inicio acumulado")
-    c_fin = find_col(df, ["Fin de validez", "Final", "Fin", "Fecha Final", "endDate"], label="Fin acumulado")
-    c_ceco = find_col(df, ["Centro de coste5", "Centro de coste", "Ce.coste", "Ceco", "Tipo Ceco"], required=False)
-    c_desc = find_col(df, ["Descripción6", "Descripción tienda", "Centro de coste descripción"], required=False)
-    c_zona = find_col(df, ["Zona", "Zone"], required=False)
-    c_reg = find_col(df, ["Region", "Región", "Texto división pers."], required=False)
-    c_resp = find_col(df, ["Nombre de personal del superio", "Superior", "Responsable", "Jefe"], required=False)
+    # IMPORTANTE:
+    # En el reporte SAP, "Nº pers." es SAP.
+    # "Número de personal" es el nombre del empleado.
+    c_id = find_col(
+        df,
+        ["Nº pers.", "N° pers.", "N pers.", "No pers", "Nro pers", "Núm. Personal", "Num Personal"],
+        label="SAP / Nº pers. acumulado",
+    )
+    c_nombre = find_col(
+        df,
+        ["Número de personal", "Nmero de personal", "Nombre empl./cand.", "Nombre empleado", "Nombre completo", "Nombre"],
+        required=False,
+    )
+    c_tipo = find_col(
+        df,
+        [
+            "Clase de absentismo o presenci",
+            "CLASE",
+            "Txt.cl.pres./ab.3",
+            "Txt.cl.pres",
+            "Tipo",
+            "Clase absent./pres.2",
+        ],
+        required=False,
+    )
+    c_ini = find_col(df, ["Inicio", "Inicio de validez", "Fecha Inicio", "startDate"], label="Inicio acumulado")
+    c_fin = find_col(df, ["Final", "Fin de validez", "Fin", "Fecha Final", "endDate"], label="Fin acumulado")
+    c_ceco = find_col(df, ["Centro de coste", "Ce.coste", "Ceco", "Tipo Ceco"], required=False)
+    c_div = find_col(df, ["División de personal", "Divisin de personal", "Division de personal"], required=False)
+    c_resp = find_col(df, ["Responsable", "Nombre de personal del superio", "Superior", "Jefe"], required=False)
 
     out = pd.DataFrame()
-    out["id"] = df[c_id].apply(clean_id)
+    out["id"] = clean_id_series(df[c_id])
     out["Nombre"] = df[c_nombre].astype(str).str.strip() if c_nombre else ""
     out["Tipo"] = df[c_tipo].astype(str).str.strip() if c_tipo else ""
-    out["inicio"] = df[c_ini].apply(parse_date)
-    out["fin"] = df[c_fin].apply(parse_date)
-    out["mes_ausencia"] = out["inicio"].apply(month_key)
+    out["inicio"] = parse_date_series(df[c_ini])
+    out["fin"] = parse_date_series(df[c_fin])
+    out["mes_ausencia"] = month_key_series(out["inicio"])
     out["Ceco"] = df[c_ceco].astype(str).str.strip() if c_ceco else ""
-    out["Descripción de tienda"] = df[c_desc].astype(str).str.strip() if c_desc else ""
-    out["zona_acumulado"] = df[c_zona].astype(str).str.strip() if c_zona else ""
-    out["regional_acumulado"] = df[c_reg].astype(str).str.strip() if c_reg else ""
+    out["División acumulado"] = df[c_div].astype(str).str.strip() if c_div else ""
     out["Responsable"] = df[c_resp].astype(str).str.strip() if c_resp else ""
 
     out = out[(out["id"] != "") & out["inicio"].notna() & out["fin"].notna()].copy()
@@ -302,20 +361,18 @@ def normalize_acumulado(df):
 
 
 def normalize_sf(df):
-    c_id = find_col(df, ["ID personal", "id", "Número de personal", "Codigo Empleado"], label="ID SF")
-    c_nombre = find_col(df, ["Nombre completo", "Nombre", "employeeName"], required=False)
+    c_id = find_col(df, ["ID personal", "id", "Codigo Empleado", "Código Empleado"], label="ID SF")
     c_ini = find_col(df, ["startDate", "Fecha de inicio de ausentismo", "Fecha de inicio", "Inicio"], label="Inicio SF")
     c_fin = find_col(df, ["endDate", "Fecha fin", "Fin", "Fecha final"], label="Fin SF")
-    c_estado = find_col(df, ["approvalStatus", "Approval Status", "Status", "Current Step Status"], required=False)
+    c_estado = find_col(df, ["approvalStatus", "Approval Status"], required=False)
     c_status = find_col(df, ["Status", "Current Step Status", "approvalStatus"], required=False)
     c_tipo = find_col(df, ["externalName (Label)", "Tipo", "Ausencia", "Descripción General (Picklist Label)"], required=False)
     c_comment = find_col(df, ["Workflow Steps Comments", "Comentarios", "Comments", "comentario"], required=False)
 
     out = pd.DataFrame()
-    out["id"] = df[c_id].apply(clean_id)
-    out["nombre_sf"] = df[c_nombre].astype(str).str.strip() if c_nombre else ""
-    out["inicio_sf"] = df[c_ini].apply(parse_date)
-    out["fin_sf"] = df[c_fin].apply(parse_date)
+    out["id"] = clean_id_series(df[c_id])
+    out["inicio_sf"] = parse_date_series(df[c_ini])
+    out["fin_sf"] = parse_date_series(df[c_fin])
     out["approvalStatus"] = df[c_estado].astype(str).str.strip().str.upper() if c_estado else ""
     out["Status_SF"] = df[c_status].astype(str).str.strip().str.upper() if c_status else out["approvalStatus"]
     out["tipo_sf"] = df[c_tipo].astype(str).str.strip() if c_tipo else ""
@@ -330,47 +387,53 @@ def normalize_ts(df):
     c_ini = find_col(df, ["Fecha_Inicio", "Fecha Inicio", "Inicio", "startDate"], label="Inicio TS")
     c_fin = find_col(df, ["Fecha_Final", "Fecha Final", "Fin", "endDate"], label="Fin TS")
     c_obs = find_col(df, ["Observaciones", "Observación", "Comentario", "Notas"], required=False)
-    c_tipo = find_col(df, ["Tipo_Ausentismo", "Tipo Ausentismo", "Motivo_Ausentismo", "Motivo"], required=False)
 
     out = pd.DataFrame()
-    out["id"] = df[c_id].apply(clean_id)
-    out["inicio_ts"] = df[c_ini].apply(parse_date)
-    out["fin_ts"] = df[c_fin].apply(parse_date)
+    out["id"] = clean_id_series(df[c_id])
+    out["inicio_ts"] = parse_date_series(df[c_ini])
+    out["fin_ts"] = parse_date_series(df[c_fin])
     out["comentario_ts"] = df[c_obs].astype(str).str.strip() if c_obs else ""
-    out["tipo_ts"] = df[c_tipo].astype(str).str.strip() if c_tipo else ""
 
     out = out[(out["id"] != "") & out["inicio_ts"].notna() & out["fin_ts"].notna()].copy()
     return out
 
 
 def normalize_md(df):
-    c_id = find_col(df, ["Nº pers.", "N° pers.", "No pers", "Nro pers", "Numero personal", "Número de personal"], label="ID MD")
-    c_nombre = find_col(df, ["Número de personal", "Nombre", "Nombre empleado"], required=False)
-    c_status = find_col(df, ["Status ocupación", "Estado", "Status"], required=False)
-    c_div = find_col(df, ["División de personal", "Division de personal"], required=False)
-    c_area = find_col(df, ["Área de nómina", "Area de nomina"], required=False)
-    c_subdiv = find_col(df, ["Subdivisión de personal", "Subdivision de personal", "Zona"], required=False)
-    c_region = find_col(df, ["Región (Estado federal", "Region", "Región"], required=False)
-    c_ceco = find_col(df, ["Ce.coste", "Ceco", "Centro de coste"], required=False)
+    # IMPORTANTE:
+    # En MD, "Nº pers." / "N pers." es SAP.
+    # "Número de personal" / "Nmero de personal" es el nombre.
+    c_id = find_col(
+        df,
+        ["Nº pers.", "N° pers.", "N pers.", "No pers", "Nro pers"],
+        label="SAP / Nº pers. MD",
+    )
+    c_nombre = find_col(df, ["Número de personal", "Nmero de personal", "Nombre empleado", "Nombre"], required=False)
+    c_status = find_col(df, ["Status ocupación", "Status ocupacin", "Status ocupacion", "Estado", "Status"], required=False)
+    c_div = find_col(df, ["División de personal", "Divisin de personal", "Division de personal"], required=False)
+    c_area = find_col(df, ["Área de nómina", "rea de nmina", "Area de nomina"], required=False)
+    c_ceco = find_col(df, ["Ce.coste", "Ceco"], required=False)
     c_desc_ceco = find_col(df, ["Centro de coste"], required=False)
     c_resp = find_col(df, ["Encargado para registro de tie", "Administrador para datos maest", "Responsable"], required=False)
-    c_cargo = find_col(df, ["Función", "Funcion", "Posición", "Cargo"], required=False)
+
+    func_cols = [c for c in df.columns if "func" in norm_text(c)]
+    c_cargo = func_cols[-1] if func_cols else None
 
     out = pd.DataFrame()
-    out["id"] = df[c_id].apply(clean_id)
+    out["id"] = clean_id_series(df[c_id])
     out["Nombre_MD"] = df[c_nombre].astype(str).str.strip() if c_nombre else ""
     out["activo"] = df[c_status].astype(str).str.strip() if c_status else "Activo"
     out["División de personal"] = df[c_div].astype(str).str.strip() if c_div else ""
     out["Área de nómina"] = df[c_area].astype(str).str.strip() if c_area else ""
-    out["zona"] = df[c_subdiv].astype(str).str.strip() if c_subdiv else ""
-    out["regional"] = df[c_region].astype(str).str.strip() if c_region else ""
     out["Ceco_MD"] = df[c_ceco].astype(str).str.strip() if c_ceco else ""
     out["Descripción de tienda_MD"] = df[c_desc_ceco].astype(str).str.strip() if c_desc_ceco else ""
     out["Responsable_MD"] = df[c_resp].astype(str).str.strip() if c_resp else ""
     out["Cargo_MD"] = df[c_cargo].astype(str).str.strip() if c_cargo else ""
 
+    out["regional"] = out["División de personal"].apply(derive_regional_from_division)
+    out["zona"] = out["División de personal"].apply(derive_zona_from_division)
+
     out = out[out["id"] != ""].copy()
-    out["_prio"] = out["activo"].str.upper().str.contains("ACTIVO", na=False).astype(int)
+    out["_prio"] = out["activo"].astype(str).str.upper().str.contains("ACTIVO", na=False).astype(int)
     out = out.sort_values(["id", "_prio"], ascending=[True, False])
     out = out.drop_duplicates("id", keep="first").drop(columns=["_prio"], errors="ignore")
     return out
@@ -385,12 +448,11 @@ def find_ts_comment(row, ts_by_id):
     if emp not in ts_by_id:
         return ""
     sub = ts_by_id[emp]
-    mask = sub.apply(lambda r: ranges_overlap(row["inicio"], row["fin"], r["inicio_ts"], r["fin_ts"]), axis=1)
+    mask = (sub["inicio_ts"] <= row["fin"]) & (sub["fin_ts"] >= row["inicio"])
     return unique_join(sub.loc[mask, "comentario_ts"].tolist())
 
 
 def classify_sf(row, sf_by_id):
-    emp = row["id"]
     result = {
         "Estado_final": "Sin registro en Hello",
         "approvalStatus_SF": "",
@@ -399,23 +461,21 @@ def classify_sf(row, sf_by_id):
         "tipo_sf": "",
         "inicio_sf": "",
         "fin_sf": "",
-        "Acción sugerida": "Validar creación o gestión en Hello",
     }
 
+    emp = row["id"]
     if emp not in sf_by_id:
         return result
 
     sub = sf_by_id[emp]
-    mask = sub.apply(lambda r: ranges_overlap(row["inicio"], row["fin"], r["inicio_sf"], r["fin_sf"]), axis=1)
-    matches = sub.loc[mask].copy()
+    matches = sub[(sub["inicio_sf"] <= row["fin"]) & (sub["fin_sf"] >= row["inicio"])].copy()
 
     if matches.empty:
         return result
 
-    norm_status = matches["approvalStatus"].astype(str).map(norm_text)
-
-    approved = matches[norm_status.str.contains("approved|aprobado", regex=True, na=False)]
-    rejected = matches[norm_status.str.contains("rejected|rechazado", regex=True, na=False)]
+    status = matches["approvalStatus"].astype(str).str.upper()
+    approved = matches[status.str.contains("APPROVED|APROBADO", regex=True, na=False)]
+    rejected = matches[status.str.contains("REJECTED|RECHAZADO", regex=True, na=False)]
 
     if not approved.empty:
         chosen = approved.iloc[0]
@@ -427,7 +487,6 @@ def classify_sf(row, sf_by_id):
             "tipo_sf": unique_join(approved["tipo_sf"].tolist()),
             "inicio_sf": fmt_date(chosen.get("inicio_sf", "")),
             "fin_sf": fmt_date(chosen.get("fin_sf", "")),
-            "Acción sugerida": "No gestionar, ya está aprobado en Hello",
         })
         return result
 
@@ -441,7 +500,6 @@ def classify_sf(row, sf_by_id):
             "tipo_sf": unique_join(rejected["tipo_sf"].tolist()),
             "inicio_sf": fmt_date(chosen.get("inicio_sf", "")),
             "fin_sf": fmt_date(chosen.get("fin_sf", "")),
-            "Acción sugerida": "Revisar comentario de rechazo y validar si sigue pendiente",
         })
         return result
 
@@ -454,7 +512,6 @@ def classify_sf(row, sf_by_id):
         "tipo_sf": unique_join(matches["tipo_sf"].tolist()),
         "inicio_sf": fmt_date(chosen.get("inicio_sf", "")),
         "fin_sf": fmt_date(chosen.get("fin_sf", "")),
-        "Acción sugerida": "Hacer seguimiento en Hello",
     })
     return result
 
@@ -472,6 +529,7 @@ def build_output(acum_raw, sf_raw, ts_raw, md_raw):
     logs.append({"Paso": "Timesoft", "Detalle": f"{len(ts):,} registros válidos"})
     logs.append({"Paso": "MD activos", "Detalle": f"{len(md):,} empleados únicos"})
 
+    # Veces notificado por mismo SAP + inicio + fin en el acumulado
     counts = acum.groupby("key").size().rename("veces_en_reporte").reset_index()
     acum = acum.merge(counts, on="key", how="left")
     acum["veces_en_reporte"] = acum["veces_en_reporte"].fillna(1).astype(int)
@@ -486,63 +544,83 @@ def build_output(acum_raw, sf_raw, ts_raw, md_raw):
     conteo["fin_txt"] = conteo["fin"].apply(fmt_date)
     conteo = conteo[["id", "Nombre", "inicio_txt", "fin_txt", "mes_ausencia", "veces_en_reporte"]]
 
+    # MD actual
     acum = acum.merge(md, on="id", how="left")
     acum["activo"] = acum["activo"].fillna("No está en MD activos actual")
 
+    # Fallbacks desde MD actual
     for col, fallback in [
         ("Nombre", "Nombre_MD"),
         ("Ceco", "Ceco_MD"),
-        ("Descripción de tienda", "Descripción de tienda_MD"),
         ("Responsable", "Responsable_MD"),
     ]:
         if fallback in acum.columns:
-            acum[col] = acum[col].mask(acum[col].astype(str).str.lower().isin(["", "nan", "none"]), acum[fallback].fillna(""))
+            acum[col] = acum[col].mask(is_blank_series(acum[col]), acum[fallback].fillna(""))
 
+    if "Descripción de tienda_MD" in acum.columns:
+        acum["Descripción de tienda"] = acum["Descripción de tienda_MD"].fillna("")
+    else:
+        acum["Descripción de tienda"] = ""
+
+    # Timesoft
     ts_by_id = {k: v for k, v in ts.groupby("id")}
     acum["comentario_ts"] = acum.apply(lambda r: find_ts_comment(r, ts_by_id), axis=1)
 
+    # SF/Hello
     sf_by_id = {k: v for k, v in sf.groupby("id")}
     sf_results = acum.apply(lambda r: pd.Series(classify_sf(r, sf_by_id)), axis=1)
     acum = pd.concat([acum.reset_index(drop=True), sf_results.reset_index(drop=True)], axis=1)
 
-    def obs(r):
+    # Observación según muestra
+    def make_observation(r):
         if r["Estado_final"] == "Gestionado en Hello":
-            return "Ausentismo aprobado en Hello/SF"
+            return "Gestionado en Hello"
         if r["Estado_final"] == "Rechazado en Hello":
-            return "Rechazado en Hello/SF con comentario" if str(r.get("comentario_sf", "")).strip() else "Rechazado en Hello/SF sin comentario"
+            return "Rechazado en Hello JM"
         if r["Estado_final"] == "Pendiente en Hello":
-            return "Pendiente de gestión en Hello/SF"
-        return "Sin registro en Hello/SF"
+            return "Pendiente de gestión en Hello"
+        if str(r.get("comentario_ts", "")).strip() and str(r.get("comentario_ts", "")).strip().lower() not in {"nan", "none"}:
+            return "Rechazado en Hello JM"
+        return "Sin registro en Hello"
 
-    acum["Observación"] = acum.apply(obs, axis=1)
+    acum["Observación"] = acum.apply(make_observation, axis=1)
     acum["inicio_txt"] = acum["inicio"].apply(fmt_date)
     acum["fin_txt"] = acum["fin"].apply(fmt_date)
 
-    final_cols = [
+    # Columnas como muestra
+    matriz_cols = [
         "id", "Nombre", "Tipo", "inicio_txt", "fin_txt", "mes_ausencia",
         "veces_en_reporte", "activo", "zona", "regional",
-        "comentario_ts", "comentario_sf", "Observación", "Estado_final",
-        "approvalStatus_SF", "Status_SF", "tipo_sf", "inicio_sf", "fin_sf",
-        "Ceco", "Descripción de tienda", "Responsable", "Cargo_MD",
-        "División de personal", "Área de nómina", "Acción sugerida"
+        "comentario_ts", "comentario_sf", "Observación",
+        "Ceco", "Descripción de tienda", "Responsable",
     ]
 
-    for col in final_cols:
+    for col in matriz_cols:
         if col not in acum.columns:
             acum[col] = ""
 
-    salida = acum[final_cols].copy()
-    gestionados = salida[salida["Estado_final"] == "Gestionado en Hello"].copy()
-    matriz = salida[salida["Estado_final"] != "Gestionado en Hello"].copy()
+    # Gestionados separados
+    gestionados_extra = [
+        "Estado_final", "approvalStatus_SF", "Status_SF", "tipo_sf", "inicio_sf", "fin_sf",
+        "Cargo_MD", "División de personal", "Área de nómina",
+    ]
+    for col in gestionados_extra:
+        if col not in acum.columns:
+            acum[col] = ""
+
+    gestionados = acum[acum["Estado_final"] == "Gestionado en Hello"][matriz_cols + gestionados_extra].copy()
+    matriz = acum[acum["Estado_final"] != "Gestionado en Hello"][matriz_cols].copy()
 
     logs.append({"Paso": "Matriz", "Detalle": f"{len(matriz):,} registros"})
     logs.append({"Paso": "Gestionados", "Detalle": f"{len(gestionados):,} registros"})
+    logs.append({"Paso": "Validación llave", "Detalle": "La columna id se toma de SAP / Nº pers., no de Nombre."})
 
     return matriz, gestionados, conteo, pd.DataFrame(logs)
 
 
 def write_excel(matriz, gestionados, conteo, log_df):
     output = io.BytesIO()
+
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         sheets = {
             "Matriz": matriz,
@@ -570,11 +648,12 @@ def write_excel(matriz, gestionados, conteo, log_df):
             ws.freeze_panes(1, 0)
             if len(df.columns) > 0:
                 ws.autofilter(0, 0, max(len(df), 1), len(df.columns) - 1)
+
             for i, col in enumerate(df.columns):
                 ws.write(0, i, col, header_fmt)
                 width = min(max(len(str(col)) + 4, 12), 42)
-                if col in {"comentario_ts", "comentario_sf", "Observación", "Acción sugerida"}:
-                    ws.set_column(i, i, 48, wrap_fmt)
+                if col in {"comentario_ts", "comentario_sf", "Observación"}:
+                    ws.set_column(i, i, 45, wrap_fmt)
                 else:
                     ws.set_column(i, i, width)
 
@@ -589,9 +668,11 @@ def write_excel(matriz, gestionados, conteo, log_df):
 st.subheader("1. Carga de archivos")
 
 c1, c2 = st.columns(2)
+
 with c1:
     file_acum = st.file_uploader("Reporte_Aus_Acumulado.xlsx", type=["xlsx", "xlsm"])
     file_ts = st.file_uploader("REP_AUS_TS.xlsx", type=["xlsx", "xlsm"])
+
 with c2:
     file_sf = st.file_uploader("Ausnom_total_SF.csv", type=["csv", "txt"])
     file_md = st.file_uploader("MD activos actual (.txt / .csv / .xlsx)", type=["txt", "csv", "xlsx", "xlsm"])
@@ -615,10 +696,10 @@ else:
 
             st.success("Archivo generado correctamente.")
 
-            a, b, c = st.columns(3)
-            a.metric("Matriz", f"{len(matriz):,}")
-            b.metric("Gestionados", f"{len(gestionados):,}")
-            c.metric("Conteo", f"{len(conteo):,}")
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Matriz", f"{len(matriz):,}")
+            k2.metric("Gestionados", f"{len(gestionados):,}")
+            k3.metric("Conteo", f"{len(conteo):,}")
 
             st.download_button(
                 "Descargar Salida_Ausentismos.xlsx",

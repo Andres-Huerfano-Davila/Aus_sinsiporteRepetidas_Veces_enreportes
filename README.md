@@ -1,21 +1,15 @@
-# Generador Salida_Ausentismos
+# Generador Salida_Ausentismos V5
 
 App de Streamlit Cloud para generar `Salida_Ausentismos.xlsx` sin gráficas.
 
-## Archivos del repositorio
+## Corrección V5
 
-- `app.py`
-- `requirements.txt`
-- `.streamlit/config.toml`
+La columna `id` de la salida se toma de `Nº pers.` / `N pers.` / SAP.
 
-## Configuración
+En los reportes SAP:
 
-El archivo `.streamlit/config.toml` permite cargas hasta 600 MB:
-
-```toml
-[server]
-maxUploadSize = 600
-```
+- `Nº pers.` = SAP / llave principal.
+- `Número de personal` = nombre del empleado.
 
 ## Insumos requeridos
 
@@ -30,3 +24,7 @@ maxUploadSize = 600
 - `Gestionados`
 - `Conteo_Notificaciones`
 - `Log`
+
+## Runtime
+
+Incluye `runtime.txt` con `python-3.12`.
