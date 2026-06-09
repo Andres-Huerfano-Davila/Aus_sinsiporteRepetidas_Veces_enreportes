@@ -14,8 +14,8 @@ import streamlit as st
 # ============================================================
 
 st.set_page_config(
-    page_title="Salida Ausentismos",
-    page_icon="📋",
+    page_title="Cantidad de veces repetidas",
+    page_icon="🦜",
     layout="wide",
 )
 
@@ -45,26 +45,64 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown('<p class="main-title">Generador Salida_Ausentismos</p>', unsafe_allow_html=True)
 st.markdown(
-    '<p class="sub-title">Genera el Excel final con Matriz y Gestionados. Sin gráficas.</p>',
+    '<p class="main-title">🦜 Cantidad de veces repetidas Ausencias sin soporte y rechazadas por docs.</p>',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    '<p class="sub-title">Genera el Excel final con Matriz y Gestionados para seguimiento de ausencias sin soporte y rechazos por documentación.</p>',
     unsafe_allow_html=True,
 )
 
 st.markdown(
     """
 <div class="info-box">
-<b>Corrección V5:</b> el campo <b>id</b> de la Matriz corresponde al <b>SAP / Nº pers.</b>.
-La columna <b>Número de personal</b> se usa como nombre del empleado cuando el archivo viene desde SAP.
+<b>Objetivo:</b> identificar ausencias sin soporte y rechazadas por documentos que se repiten en los reportes.
+<br><br>
+<b>Llave principal:</b> SAP / Nº pers. + inicio + fin de la ausencia.
+<br>
+<b>Validador de gestión:</b> IT2001 actual. Si la ausencia ya no existe en IT2001 actual, pasa a Gestionados.
 </div>
 """,
     unsafe_allow_html=True,
 )
 
+with st.expander("Criterios usados por la herramienta", expanded=False):
+    st.markdown(
+        """
+- La base principal es el **Reporte_Aus_Acumulado.xlsx**.
+- El **SAP / Nº pers.** es la llave principal del proceso.
+- El **IT2001 actual** define si el ausentismo sigue vivo o ya fue gestionado/eliminado/corregido.
+- Si el ausentismo aparece en IT2001 actual con el mismo SAP y fechas iguales o solapadas, queda en **Matriz**.
+- Si el ausentismo ya no aparece en IT2001 actual, pasa a **Gestionados**.
+- SF/Hello se usa para traer estado y comentarios, pero no define por sí solo si está gestionado.
+- Timesoft se cruza por SAP y fechas solapadas para traer observaciones.
+- El MD se usa como foto de **activos a hoy**, no como validación histórica.
+- `veces_en_reporte` se calcula considerando el conteo del acumulado y los meses entre la fecha de modificación y el último reporte detectado.
+        """
+    )
+
 
 # ============================================================
 # UTILIDADES
 # ============================================================
+
+MONTHS_ES = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+}
+
 
 def norm_text(value):
     value = "" if value is None else str(value)
@@ -91,32 +129,18 @@ def dedupe_columns(df):
     return df
 
 
-def clean_id_value(value):
-    if pd.isna(value):
-        return ""
-    text = str(value).strip()
-    if re.fullmatch(r"\d+\.0", text):
-        text = text[:-2]
-    m = re.search(r"\d+", text)
-    return m.group(0) if m else text
-
-
 def clean_id_series(s):
-    return s.astype(str).str.strip().str.replace(r"\.0$", "", regex=True).str.extract(r"(\d+)", expand=False).fillna(
-        s.astype(str).str.strip()
+    return (
+        s.astype(str)
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+        .str.extract(r"(\d+)", expand=False)
+        .fillna(s.astype(str).str.strip())
     )
 
 
 def parse_date_series(s):
     return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.normalize()
-
-
-def parse_date_value(value):
-    if pd.isna(value) or value == "":
-        return pd.NaT
-    if isinstance(value, (pd.Timestamp, datetime)):
-        return pd.to_datetime(value).normalize()
-    return pd.to_datetime(str(value).strip(), errors="coerce", dayfirst=True).normalize()
 
 
 def fmt_date(value):
@@ -175,16 +199,56 @@ def find_col(df, candidates, required=True, label=""):
     return None
 
 
-def first_existing_col(df, candidates):
+def is_blank_series(s):
+    return s.astype(str).str.strip().str.lower().isin(["", "nan", "none", "nat"])
+
+
+def parse_report_period(value):
+    """
+    Detecta mes/año desde Source.Name, por ejemplo:
+    01. Informe Ausentismos Enero 2026.xlsx -> 2026-01
+    """
+    text = norm_text(value)
+
+    year_match = re.search(r"(20\d{2})", text)
+    if not year_match:
+        return pd.NaT
+    year = int(year_match.group(1))
+
+    for month_name, month_num in MONTHS_ES.items():
+        if month_name in text:
+            return pd.Period(year=year, month=month_num, freq="M")
+
+    # Soporta nombres tipo 2026-05 o 05-2026
+    m = re.search(r"(20\d{2})\D(0?[1-9]|1[0-2])", text)
+    if m:
+        return pd.Period(year=int(m.group(1)), month=int(m.group(2)), freq="M")
+
+    m = re.search(r"(0?[1-9]|1[0-2])\D(20\d{2})", text)
+    if m:
+        return pd.Period(year=int(m.group(2)), month=int(m.group(1)), freq="M")
+
+    return pd.NaT
+
+
+def period_from_date(value):
+    if pd.isna(value):
+        return pd.NaT
+    value = pd.to_datetime(value)
+    return pd.Period(year=value.year, month=value.month, freq="M")
+
+
+def months_diff_inclusive(start_period, end_period):
+    if pd.isna(start_period) or pd.isna(end_period):
+        return 0
     try:
-        return find_col(df, candidates, required=False)
+        return max(0, (end_period.year - start_period.year) * 12 + (end_period.month - start_period.month) + 1)
     except Exception:
-        return None
+        return 0
 
 
 def derive_regional_from_division(value):
     text = str(value)
-    # Soporta Región, Region y Regin cuando el TXT SAP pierde tildes/letras por encoding.
     m = re.search(r"(?:Regi[oó]n|Region|Regin)\s*(\d+)", text, flags=re.IGNORECASE)
     if not m:
         return ""
@@ -197,18 +261,12 @@ def derive_zona_from_division(value):
     if not m:
         return ""
     code = "ZN" + str(m.group(1)).zfill(2)
-
-    # Mapeo simple para conservar estilo de muestra.
     zone_names = {
         "ZN01": "Zona Occidente ZN01",
         "ZN02": "Zona Norte ZN02",
         "ZN03": "Zona Centro ZN03",
     }
     return zone_names.get(code, code)
-
-
-def is_blank_series(s):
-    return s.astype(str).str.strip().str.lower().isin(["", "nan", "none", "nat"])
 
 
 # ============================================================
@@ -270,8 +328,6 @@ def read_md_txt_cached(raw_bytes):
         header_idx = None
         for i, row in enumerate(rows[:80]):
             nrow = [norm_text(x) for x in row]
-            joined = " ".join(nrow)
-            # Header SAP exportado: N pers. / Número de personal / Status ocupación...
             if any("pers" in x for x in nrow[:2]) and any("status" in x for x in nrow[:6]):
                 header_idx = i
                 break
@@ -313,9 +369,7 @@ def read_uploaded(uploaded, kind):
 # ============================================================
 
 def normalize_acumulado(df):
-    # IMPORTANTE:
-    # En el reporte SAP, "Nº pers." es SAP.
-    # "Número de personal" es el nombre del empleado.
+    c_source = find_col(df, ["Source.Name", "Source Name", "Archivo", "Nombre archivo"], required=False)
     c_id = find_col(
         df,
         ["Nº pers.", "N° pers.", "N pers.", "No pers", "Nro pers", "Núm. Personal", "Num Personal"],
@@ -340,23 +394,50 @@ def normalize_acumulado(df):
     )
     c_ini = find_col(df, ["Inicio", "Inicio de validez", "Fecha Inicio", "startDate"], label="Inicio acumulado")
     c_fin = find_col(df, ["Final", "Fin de validez", "Fin", "Fecha Final", "endDate"], label="Fin acumulado")
+    c_mod = find_col(df, ["Modif/el", "Modif el", "Modif.el", "Mod.", "Modificado el"], required=False)
     c_ceco = find_col(df, ["Centro de coste", "Ce.coste", "Ceco", "Tipo Ceco"], required=False)
     c_div = find_col(df, ["División de personal", "Divisin de personal", "Division de personal"], required=False)
-    c_resp = find_col(df, ["Responsable", "Nombre de personal del superio", "Superior", "Jefe"], required=False)
 
     out = pd.DataFrame()
+    out["reporte_origen"] = df[c_source].astype(str).str.strip() if c_source else ""
     out["id"] = clean_id_series(df[c_id])
     out["Nombre"] = df[c_nombre].astype(str).str.strip() if c_nombre else ""
     out["Tipo"] = df[c_tipo].astype(str).str.strip() if c_tipo else ""
     out["inicio"] = parse_date_series(df[c_ini])
     out["fin"] = parse_date_series(df[c_fin])
-    out["mes_ausencia"] = month_key_series(out["inicio"])
+    out["fecha_modificacion"] = parse_date_series(df[c_mod]) if c_mod else pd.NaT
     out["Ceco"] = df[c_ceco].astype(str).str.strip() if c_ceco else ""
     out["División acumulado"] = df[c_div].astype(str).str.strip() if c_div else ""
-    out["Responsable"] = df[c_resp].astype(str).str.strip() if c_resp else ""
 
     out = out[(out["id"] != "") & out["inicio"].notna() & out["fin"].notna()].copy()
+    out["mes_ausencia"] = month_key_series(out["inicio"])
+    out["mes_reporte_period"] = out["reporte_origen"].apply(parse_report_period)
+    out["mes_modificacion_period"] = out["fecha_modificacion"].apply(period_from_date)
     out["key"] = make_key(out, "id", "inicio", "fin")
+    return out
+
+
+def normalize_it2001(df):
+    c_id = find_col(
+        df,
+        ["Nº pers.", "N° pers.", "N pers.", "No pers", "Nro pers", "Número de personal"],
+        label="SAP / Nº pers. IT2001",
+    )
+    c_nombre = find_col(df, ["Nom.empl./cand.", "Nombre", "Nombre empleado", "Número de personal"], required=False)
+    c_tipo = find_col(df, ["Txt.cl.pres./ab. _2", "Txt.cl.pres./ab.2", "Txt.cl.pres", "Descripción"], required=False)
+    c_ini = find_col(df, ["Válido de", "Valido de", "Inicio de validez", "Inicio"], label="Inicio IT2001")
+    c_fin = find_col(df, ["Válido a", "Valido a", "Fin de validez", "Fin", "Final"], label="Fin IT2001")
+    c_ceco = find_col(df, ["Ce.coste", "Centro de coste", "Ceco"], required=False)
+
+    out = pd.DataFrame()
+    out["id"] = clean_id_series(df[c_id])
+    out["nombre_it2001"] = df[c_nombre].astype(str).str.strip() if c_nombre else ""
+    out["tipo_it2001"] = df[c_tipo].astype(str).str.strip() if c_tipo else ""
+    out["inicio_it2001"] = parse_date_series(df[c_ini])
+    out["fin_it2001"] = parse_date_series(df[c_fin])
+    out["ceco_it2001"] = df[c_ceco].astype(str).str.strip() if c_ceco else ""
+
+    out = out[(out["id"] != "") & out["inicio_it2001"].notna() & out["fin_it2001"].notna()].copy()
     return out
 
 
@@ -399,14 +480,7 @@ def normalize_ts(df):
 
 
 def normalize_md(df):
-    # IMPORTANTE:
-    # En MD, "Nº pers." / "N pers." es SAP.
-    # "Número de personal" / "Nmero de personal" es el nombre.
-    c_id = find_col(
-        df,
-        ["Nº pers.", "N° pers.", "N pers.", "No pers", "Nro pers"],
-        label="SAP / Nº pers. MD",
-    )
+    c_id = find_col(df, ["Nº pers.", "N° pers.", "N pers.", "No pers", "Nro pers"], label="SAP / Nº pers. MD")
     c_nombre = find_col(df, ["Número de personal", "Nmero de personal", "Nombre empleado", "Nombre"], required=False)
     c_status = find_col(df, ["Status ocupación", "Status ocupacin", "Status ocupacion", "Estado", "Status"], required=False)
     c_div = find_col(df, ["División de personal", "Divisin de personal", "Division de personal"], required=False)
@@ -425,8 +499,8 @@ def normalize_md(df):
     out["División de personal"] = df[c_div].astype(str).str.strip() if c_div else ""
     out["Área de nómina"] = df[c_area].astype(str).str.strip() if c_area else ""
     out["Ceco_MD"] = df[c_ceco].astype(str).str.strip() if c_ceco else ""
-    out["Descripción de tienda_MD"] = df[c_desc_ceco].astype(str).str.strip() if c_desc_ceco else ""
-    out["Responsable_MD"] = df[c_resp].astype(str).str.strip() if c_resp else ""
+    out["Descripción de tienda"] = df[c_desc_ceco].astype(str).str.strip() if c_desc_ceco else ""
+    out["Responsable"] = df[c_resp].astype(str).str.strip() if c_resp else ""
     out["Cargo_MD"] = df[c_cargo].astype(str).str.strip() if c_cargo else ""
 
     out["regional"] = out["División de personal"].apply(derive_regional_from_division)
@@ -440,21 +514,40 @@ def normalize_md(df):
 
 
 # ============================================================
-# PROCESAMIENTO
+# CRUCES
 # ============================================================
 
-def find_ts_comment(row, ts_by_id):
+def classify_it2001(row, it_by_id):
+    result = {
+        "estado_it2001": "No existe en IT2001 actual",
+        "tipo_it2001": "",
+        "inicio_it2001": "",
+        "fin_it2001": "",
+    }
+
     emp = row["id"]
-    if emp not in ts_by_id:
-        return ""
-    sub = ts_by_id[emp]
-    mask = (sub["inicio_ts"] <= row["fin"]) & (sub["fin_ts"] >= row["inicio"])
-    return unique_join(sub.loc[mask, "comentario_ts"].tolist())
+    if emp not in it_by_id:
+        return result
+
+    sub = it_by_id[emp]
+    matches = sub[(sub["inicio_it2001"] <= row["fin"]) & (sub["fin_it2001"] >= row["inicio"])]
+
+    if matches.empty:
+        return result
+
+    chosen = matches.iloc[0]
+    result.update({
+        "estado_it2001": "Sigue en IT2001 actual",
+        "tipo_it2001": unique_join(matches["tipo_it2001"].tolist()),
+        "inicio_it2001": fmt_date(chosen.get("inicio_it2001", "")),
+        "fin_it2001": fmt_date(chosen.get("fin_it2001", "")),
+    })
+    return result
 
 
 def classify_sf(row, sf_by_id):
     result = {
-        "Estado_final": "Sin registro en Hello",
+        "estado_hello": "Sin registro en Hello",
         "approvalStatus_SF": "",
         "Status_SF": "",
         "comentario_sf": "",
@@ -480,7 +573,7 @@ def classify_sf(row, sf_by_id):
     if not approved.empty:
         chosen = approved.iloc[0]
         result.update({
-            "Estado_final": "Gestionado en Hello",
+            "estado_hello": "Aprobado en Hello",
             "approvalStatus_SF": chosen.get("approvalStatus", ""),
             "Status_SF": chosen.get("Status_SF", ""),
             "comentario_sf": unique_join(approved["comentario_sf"].tolist()),
@@ -493,7 +586,7 @@ def classify_sf(row, sf_by_id):
     if not rejected.empty:
         chosen = rejected.iloc[0]
         result.update({
-            "Estado_final": "Rechazado en Hello",
+            "estado_hello": "Rechazado en Hello",
             "approvalStatus_SF": chosen.get("approvalStatus", ""),
             "Status_SF": chosen.get("Status_SF", ""),
             "comentario_sf": unique_join(rejected["comentario_sf"].tolist()),
@@ -505,7 +598,7 @@ def classify_sf(row, sf_by_id):
 
     chosen = matches.iloc[0]
     result.update({
-        "Estado_final": "Pendiente en Hello",
+        "estado_hello": "Pendiente en Hello",
         "approvalStatus_SF": unique_join(matches["approvalStatus"].tolist()),
         "Status_SF": unique_join(matches["Status_SF"].tolist()),
         "comentario_sf": unique_join(matches["comentario_sf"].tolist()),
@@ -516,104 +609,144 @@ def classify_sf(row, sf_by_id):
     return result
 
 
-def build_output(acum_raw, sf_raw, ts_raw, md_raw):
+def find_ts_comment(row, ts_by_id):
+    emp = row["id"]
+    if emp not in ts_by_id:
+        return ""
+    sub = ts_by_id[emp]
+    matches = sub[(sub["inicio_ts"] <= row["fin"]) & (sub["fin_ts"] >= row["inicio"])]
+    return unique_join(matches["comentario_ts"].tolist())
+
+
+def build_output(acum_raw, it_raw, sf_raw, ts_raw, md_raw):
     logs = []
 
     acum = normalize_acumulado(acum_raw)
+    it2001 = normalize_it2001(it_raw)
     sf = normalize_sf(sf_raw)
     ts = normalize_ts(ts_raw)
     md = normalize_md(md_raw)
 
+    latest_report_period = None
+    valid_report_periods = [p for p in acum["mes_reporte_period"].dropna().tolist() if not pd.isna(p)]
+    if valid_report_periods:
+        latest_report_period = max(valid_report_periods)
+    else:
+        valid_mod_periods = [p for p in acum["mes_modificacion_period"].dropna().tolist() if not pd.isna(p)]
+        latest_report_period = max(valid_mod_periods) if valid_mod_periods else pd.Period(pd.Timestamp.today(), freq="M")
+
+    latest_report_label = str(latest_report_period)
+
     logs.append({"Paso": "Acumulado", "Detalle": f"{len(acum):,} registros válidos"})
+    logs.append({"Paso": "IT2001 actual", "Detalle": f"{len(it2001):,} registros válidos"})
     logs.append({"Paso": "SF/Hello", "Detalle": f"{len(sf):,} registros válidos"})
     logs.append({"Paso": "Timesoft", "Detalle": f"{len(ts):,} registros válidos"})
     logs.append({"Paso": "MD activos", "Detalle": f"{len(md):,} empleados únicos"})
+    logs.append({"Paso": "Último reporte detectado", "Detalle": latest_report_label})
 
-    # Veces notificado por mismo SAP + inicio + fin en el acumulado
-    counts = acum.groupby("key").size().rename("veces_en_reporte").reset_index()
-    acum = acum.merge(counts, on="key", how="left")
-    acum["veces_en_reporte"] = acum["veces_en_reporte"].fillna(1).astype(int)
-
-    conteo = (
-        acum.groupby(["id", "Nombre", "inicio", "fin", "mes_ausencia"], dropna=False)
-        .size()
-        .rename("veces_en_reporte")
+    # Conteo por registros reales del acumulado
+    count_real = (
+        acum.groupby("key")["mes_reporte_period"]
+        .nunique(dropna=True)
+        .rename("conteo_registros_acumulado")
         .reset_index()
     )
-    conteo["inicio_txt"] = conteo["inicio"].apply(fmt_date)
-    conteo["fin_txt"] = conteo["fin"].apply(fmt_date)
-    conteo = conteo[["id", "Nombre", "inicio_txt", "fin_txt", "mes_ausencia", "veces_en_reporte"]]
+    fallback_count = acum.groupby("key").size().rename("conteo_filas_acumulado").reset_index()
 
-    # MD actual
+    acum = acum.merge(count_real, on="key", how="left").merge(fallback_count, on="key", how="left")
+    acum["conteo_registros_acumulado"] = acum["conteo_registros_acumulado"].fillna(0).astype(int)
+    acum["conteo_filas_acumulado"] = acum["conteo_filas_acumulado"].fillna(1).astype(int)
+
+    acum["meses_estimados_reporte"] = acum["mes_modificacion_period"].apply(
+        lambda p: months_diff_inclusive(p, latest_report_period)
+    )
+    acum["veces_en_reporte"] = acum[["conteo_registros_acumulado", "conteo_filas_acumulado", "meses_estimados_reporte"]].max(axis=1).astype(int)
+    acum["mes_ultimo_reporte"] = latest_report_label
+    acum["fecha_modificacion_txt"] = acum["fecha_modificacion"].apply(fmt_date)
+    acum["mes_modificacion"] = acum["mes_modificacion_period"].astype(str).replace("NaT", "")
+
+    # Reducir a una línea por SAP + inicio + fin para la matriz
+    # Conserva la fila más reciente por mes de reporte si existe.
+    acum["_sort_period"] = acum["mes_reporte_period"].astype(str).replace("NaT", "")
+    acum = acum.sort_values(["key", "_sort_period"], ascending=[True, False]).drop_duplicates("key", keep="first")
+
+    # MD
     acum = acum.merge(md, on="id", how="left")
     acum["activo"] = acum["activo"].fillna("No está en MD activos actual")
 
-    # Fallbacks desde MD actual
     for col, fallback in [
         ("Nombre", "Nombre_MD"),
         ("Ceco", "Ceco_MD"),
-        ("Responsable", "Responsable_MD"),
     ]:
         if fallback in acum.columns:
             acum[col] = acum[col].mask(is_blank_series(acum[col]), acum[fallback].fillna(""))
 
-    if "Descripción de tienda_MD" in acum.columns:
-        acum["Descripción de tienda"] = acum["Descripción de tienda_MD"].fillna("")
-    else:
-        acum["Descripción de tienda"] = ""
+    # IT2001 actual define Matriz vs Gestionados
+    it_by_id = {k: v for k, v in it2001.groupby("id")}
+    it_result = acum.apply(lambda r: pd.Series(classify_it2001(r, it_by_id)), axis=1)
+    acum = pd.concat([acum.reset_index(drop=True), it_result.reset_index(drop=True)], axis=1)
 
-    # Timesoft
+    # SF/Hello contexto
+    sf_by_id = {k: v for k, v in sf.groupby("id")}
+    sf_result = acum.apply(lambda r: pd.Series(classify_sf(r, sf_by_id)), axis=1)
+    acum = pd.concat([acum.reset_index(drop=True), sf_result.reset_index(drop=True)], axis=1)
+
+    # Timesoft comentario
     ts_by_id = {k: v for k, v in ts.groupby("id")}
     acum["comentario_ts"] = acum.apply(lambda r: find_ts_comment(r, ts_by_id), axis=1)
 
-    # SF/Hello
-    sf_by_id = {k: v for k, v in sf.groupby("id")}
-    sf_results = acum.apply(lambda r: pd.Series(classify_sf(r, sf_by_id)), axis=1)
-    acum = pd.concat([acum.reset_index(drop=True), sf_results.reset_index(drop=True)], axis=1)
-
-    # Observación según muestra
+    # Observación
     def make_observation(r):
-        if r["Estado_final"] == "Gestionado en Hello":
-            return "Gestionado en Hello"
-        if r["Estado_final"] == "Rechazado en Hello":
-            return "Rechazado en Hello JM"
-        if r["Estado_final"] == "Pendiente en Hello":
-            return "Pendiente de gestión en Hello"
-        if str(r.get("comentario_ts", "")).strip() and str(r.get("comentario_ts", "")).strip().lower() not in {"nan", "none"}:
-            return "Rechazado en Hello JM"
-        return "Sin registro en Hello"
+        if r["estado_it2001"] == "No existe en IT2001 actual":
+            if r["estado_hello"] == "Aprobado en Hello":
+                return "No existe en IT2001 actual / aprobado en Hello"
+            if r["estado_hello"] == "Rechazado en Hello":
+                return "No existe en IT2001 actual / revisar si fue eliminado o corregido por salario"
+            return "No existe en IT2001 actual / posible eliminación o corrección por salario"
+
+        # Sigue vivo en IT2001
+        if r["estado_hello"] == "Rechazado en Hello":
+            return "Sigue en IT2001 y está rechazado en Hello"
+        if r["estado_hello"] == "Pendiente en Hello":
+            return "Sigue en IT2001 pendiente en Hello"
+        if r["estado_hello"] == "Aprobado en Hello":
+            return "Sigue en IT2001 y aprobado en Hello"
+        return "Sigue en IT2001 sin registro en Hello"
 
     acum["Observación"] = acum.apply(make_observation, axis=1)
     acum["inicio_txt"] = acum["inicio"].apply(fmt_date)
     acum["fin_txt"] = acum["fin"].apply(fmt_date)
 
-    # Columnas como muestra
-    matriz_cols = [
+    final_cols = [
         "id", "Nombre", "Tipo", "inicio_txt", "fin_txt", "mes_ausencia",
-        "veces_en_reporte", "activo", "zona", "regional",
+        "fecha_modificacion_txt", "mes_modificacion", "mes_ultimo_reporte",
+        "veces_en_reporte", "conteo_registros_acumulado", "meses_estimados_reporte",
+        "estado_it2001", "tipo_it2001", "inicio_it2001", "fin_it2001",
+        "activo", "zona", "regional",
+        "estado_hello", "approvalStatus_SF", "Status_SF",
         "comentario_ts", "comentario_sf", "Observación",
-        "Ceco", "Descripción de tienda", "Responsable",
+        "Ceco", "Descripción de tienda", "Responsable", "Cargo_MD",
+        "División de personal", "Área de nómina",
     ]
 
-    for col in matriz_cols:
+    for col in final_cols:
         if col not in acum.columns:
             acum[col] = ""
 
-    # Gestionados separados
-    gestionados_extra = [
-        "Estado_final", "approvalStatus_SF", "Status_SF", "tipo_sf", "inicio_sf", "fin_sf",
-        "Cargo_MD", "División de personal", "Área de nómina",
-    ]
-    for col in gestionados_extra:
-        if col not in acum.columns:
-            acum[col] = ""
+    salida = acum[final_cols].copy()
 
-    gestionados = acum[acum["Estado_final"] == "Gestionado en Hello"][matriz_cols + gestionados_extra].copy()
-    matriz = acum[acum["Estado_final"] != "Gestionado en Hello"][matriz_cols].copy()
+    matriz = salida[salida["estado_it2001"] == "Sigue en IT2001 actual"].copy()
+    gestionados = salida[salida["estado_it2001"] != "Sigue en IT2001 actual"].copy()
 
-    logs.append({"Paso": "Matriz", "Detalle": f"{len(matriz):,} registros"})
-    logs.append({"Paso": "Gestionados", "Detalle": f"{len(gestionados):,} registros"})
-    logs.append({"Paso": "Validación llave", "Detalle": "La columna id se toma de SAP / Nº pers., no de Nombre."})
+    conteo = acum[[
+        "id", "Nombre", "inicio_txt", "fin_txt", "fecha_modificacion_txt",
+        "mes_modificacion", "mes_ultimo_reporte", "conteo_registros_acumulado",
+        "meses_estimados_reporte", "veces_en_reporte", "reporte_origen"
+    ]].copy()
+
+    logs.append({"Paso": "Matriz", "Detalle": f"{len(matriz):,} registros que siguen en IT2001"})
+    logs.append({"Paso": "Gestionados", "Detalle": f"{len(gestionados):,} registros que ya no están en IT2001"})
+    logs.append({"Paso": "Criterio de veces", "Detalle": "max(conteo acumulado por mes, conteo filas, meses entre modificación y último reporte)"})
 
     return matriz, gestionados, conteo, pd.DataFrame(logs)
 
@@ -653,7 +786,7 @@ def write_excel(matriz, gestionados, conteo, log_df):
                 ws.write(0, i, col, header_fmt)
                 width = min(max(len(str(col)) + 4, 12), 42)
                 if col in {"comentario_ts", "comentario_sf", "Observación"}:
-                    ws.set_column(i, i, 45, wrap_fmt)
+                    ws.set_column(i, i, 48, wrap_fmt)
                 else:
                     ws.set_column(i, i, width)
 
@@ -665,12 +798,13 @@ def write_excel(matriz, gestionados, conteo, log_df):
 # UI
 # ============================================================
 
-st.subheader("1. Carga de archivos")
+st.subheader("1. Carga de insumos")
 
 c1, c2 = st.columns(2)
 
 with c1:
     file_acum = st.file_uploader("Reporte_Aus_Acumulado.xlsx", type=["xlsx", "xlsm"])
+    file_it = st.file_uploader("IT2001 actual a hoy.xlsx", type=["xlsx", "xlsm"])
     file_ts = st.file_uploader("REP_AUS_TS.xlsx", type=["xlsx", "xlsm"])
 
 with c2:
@@ -678,20 +812,21 @@ with c2:
     file_md = st.file_uploader("MD activos actual (.txt / .csv / .xlsx)", type=["txt", "csv", "xlsx", "xlsm"])
 
 st.divider()
-st.subheader("2. Generar salida")
+st.subheader("2. Generar Excel de salida")
 
-if not all([file_acum, file_sf, file_ts, file_md]):
-    st.info("Carga los 4 archivos para habilitar la generación.")
+if not all([file_acum, file_it, file_sf, file_ts, file_md]):
+    st.info("Carga los 5 archivos para habilitar la generación.")
 else:
-    if st.button("Generar Salida_Ausentismos.xlsx", type="primary", use_container_width=True):
+    if st.button("Generar Excel Salida_Ausentismos.xlsx", type="primary", use_container_width=True):
         try:
             with st.spinner("Procesando archivos..."):
                 acum_raw = read_uploaded(file_acum, "excel")
+                it_raw = read_uploaded(file_it, "excel")
                 sf_raw = read_uploaded(file_sf, "sf")
                 ts_raw = read_uploaded(file_ts, "excel")
                 md_raw = read_uploaded(file_md, "md")
 
-                matriz, gestionados, conteo, log_df = build_output(acum_raw, sf_raw, ts_raw, md_raw)
+                matriz, gestionados, conteo, log_df = build_output(acum_raw, it_raw, sf_raw, ts_raw, md_raw)
                 excel_bytes = write_excel(matriz, gestionados, conteo, log_df)
 
             st.success("Archivo generado correctamente.")
@@ -712,6 +847,9 @@ else:
             with st.expander("Vista previa Matriz"):
                 st.dataframe(matriz.head(100), use_container_width=True)
 
+            with st.expander("Vista previa Gestionados"):
+                st.dataframe(gestionados.head(100), use_container_width=True)
+
             with st.expander("Log"):
                 st.dataframe(log_df, use_container_width=True)
 
@@ -719,4 +857,4 @@ else:
             st.error("No se pudo generar el archivo.")
             st.exception(e)
 
-st.caption("Creado por Andrés Huérfano Dávila - Nómina JMC")
+st.caption("🦜 Creado por Andrés Huérfano Dávila - Nómina JMC")
