@@ -1,53 +1,32 @@
 # Generador Salida_Ausentismos
 
-Aplicación en Streamlit Cloud para generar el archivo `Salida_Ausentismos.xlsx`.
+App de Streamlit Cloud para generar `Salida_Ausentismos.xlsx` sin gráficas.
 
-## Insumos
+## Archivos del repositorio
 
-La app solicita 4 archivos:
+- `app.py`
+- `requirements.txt`
+- `.streamlit/config.toml`
 
-1. `Reporte_Aus_Acumulado.xlsx`
-2. `Ausnom_total_SF.csv`
-3. `REP_AUS_TS.xlsx`
-4. `MD activos actual` en formato `.txt`, `.csv` o `.xlsx`
+## Configuración
 
-## Salida
-
-Genera un Excel con estas hojas:
-
-- `Matriz`: registros que siguen pendientes por revisar o gestionar.
-- `Gestionados`: registros que en SF/Hello aparecen aprobados (`APPROVED`) con fechas iguales o solapadas.
-- `Conteo_Notificaciones`: conteo por empleado y rango de ausencia.
-- `Log`: resumen del proceso.
-
-## Regla principal
-
-La base nace del `Reporte_Aus_Acumulado.xlsx`.
-
-- Si en SF existe una ausencia `APPROVED` con mismo ID y fecha igual o solapada, pasa a `Gestionados`.
-- Si en SF existe `REJECTED`, queda en `Matriz` y trae `Workflow Steps Comments`.
-- Si en SF existe pendiente, queda en `Matriz` como pendiente.
-- Si no existe en SF, queda en `Matriz` como `Sin registro en Hello/SF`.
-
-El MD es foto actual de activos. No evalúa la fecha histórica de la ausencia.
-
-## Despliegue en Streamlit Cloud
-
-1. Crea un repositorio en GitHub.
-2. Sube `app.py`, `requirements.txt` y este `README.md`.
-3. Entra a Streamlit Cloud.
-4. Selecciona el repositorio.
-5. Main file path: `app.py`.
-6. Deploy.
-
-
-## Tamaño máximo de carga
-
-Este repositorio incluye `.streamlit/config.toml` con:
+El archivo `.streamlit/config.toml` permite cargas hasta 600 MB:
 
 ```toml
 [server]
 maxUploadSize = 600
 ```
 
-Esto permite cargar archivos de hasta 600 MB en Streamlit Cloud.
+## Insumos requeridos
+
+1. `Reporte_Aus_Acumulado.xlsx`
+2. `Ausnom_total_SF.csv`
+3. `REP_AUS_TS.xlsx`
+4. `MD activos actual` en `.txt`, `.csv` o `.xlsx`
+
+## Salida
+
+- `Matriz`
+- `Gestionados`
+- `Conteo_Notificaciones`
+- `Log`
