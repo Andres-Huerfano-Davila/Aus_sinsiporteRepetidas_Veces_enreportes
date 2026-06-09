@@ -39,3 +39,15 @@ El MD es foto actual de activos. No evalúa la fecha histórica de la ausencia.
 4. Selecciona el repositorio.
 5. Main file path: `app.py`.
 6. Deploy.
+
+
+## Tamaño máximo de carga
+
+Este repositorio incluye `.streamlit/config.toml` con:
+
+```toml
+[server]
+maxUploadSize = 600
+```
+
+Esto permite cargar archivos de hasta 600 MB en Streamlit Cloud.
