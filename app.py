@@ -702,7 +702,7 @@ def build_output(acum_raw, it_raw, sf_raw, ts_raw, md_raw):
                 return "No existe en IT2001 actual / aprobado en Hello"
             if r["estado_hello"] == "Rechazado en Hello":
                 return "No existe en IT2001 actual / revisar si fue eliminado o corregido por salario"
-            return "No existe en IT2001 actual / posible eliminación o corrección por salario"
+            return "No existe en IT2001 actual / corregido"
 
         # Sigue vivo en IT2001
         if r["estado_hello"] == "Rechazado en Hello":
